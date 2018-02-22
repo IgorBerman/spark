@@ -19,6 +19,7 @@ package org.apache.spark.scheduler.cluster.mesos
 
 import java.io.File
 import java.util.{Collections, List => JList}
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 
 import scala.collection.JavaConverters._
@@ -31,10 +32,11 @@ import org.apache.mesos.SchedulerDriver
 import org.apache.spark.{SecurityManager, SparkContext, SparkException, TaskState}
 import org.apache.spark.network.netty.SparkTransportConf
 import org.apache.spark.network.shuffle.mesos.MesosExternalShuffleClient
+import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.rpc.RpcEndpointAddress
 import org.apache.spark.scheduler.{SlaveLost, TaskSchedulerImpl}
 import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend
-import org.apache.spark.util.Utils
+import org.apache.spark.util.{SystemClock, Utils}
 
 /**
  * A SchedulerBackend that runs tasks on Mesos, but uses "coarse-grained" tasks, where it holds
@@ -50,13 +52,20 @@ private[spark] class MesosCoarseGrainedSchedulerBackend(
     scheduler: TaskSchedulerImpl,
     sc: SparkContext,
     master: String,
-    securityManager: SecurityManager)
+    securityManager: SecurityManager,
+    clock: org.apache.spark.util.Clock = new SystemClock())
   extends CoarseGrainedSchedulerBackend(scheduler, sc.env.rpcEnv)
   with org.apache.mesos.Scheduler
   with MesosSchedulerUtils {
 
-  // Blacklist a slave after this many failures
-  private val MAX_SLAVE_FAILURES = 2
+  private val mesosSlaveBlacklistingMaxFailures =
+    conf.getInt("spark.mesos.slaves.blacklisting.maxFailures", 2)
+
+  private val mesosSlaveFailureTimeoutMs =
+    JavaUtils.timeStringAs(
+      conf.get("spark.mesos.slaves.blacklisting.failureTimeout", "1min"),
+      TimeUnit.MILLISECONDS)
+
 
   private val maxCoresOption = conf.getOption("spark.cores.max").map(_.toInt)
 
@@ -179,6 +188,7 @@ private[spark] class MesosCoarseGrainedSchedulerBackend(
       sc.conf.getOption("spark.mesos.driver.frameworkId")
     )
 
+    logWarning("Starting with custom build 4 for enabling mesos slaves blacklisting config")
     unsetFrameworkID(sc)
     startScheduler(driver)
   }
@@ -491,13 +501,33 @@ private[spark] class MesosCoarseGrainedSchedulerBackend(
     val mem = executorMemory(sc)
     val ports = getRangeResource(resources, "ports")
     val meetsPortRequirements = checkPorts(sc.conf, ports)
+    val latestFailuresForSlaveId = latestFailures(slaveId)
+
+    if (numExecutors() >= executorLimit) {
+      logDebug(s"Can't launch task, numExecutors($numExecutors()) >= executorLimit($executorLimit)")
+    }
+
+    if (latestFailuresForSlaveId >= mesosSlaveBlacklistingMaxFailures) {
+      logDebug(s"Can't launch task, number of failures($latestFailuresForSlaveId) " +
+        s"in last $mesosSlaveFailureTimeoutMs ms" +
+        s"on slave($slaveId) >= maxSlaveFailures()($mesosSlaveBlacklistingMaxFailures)")
+    }
+
+    if (cpus + totalCoresAcquired > maxCores) {
+      logDebug(s"Can't launch task, cpus($cpus) + totalCoresAcquired($totalCoresAcquired) " +
+        s" > maxCores($maxCores)")
+    }
+
+    if (!meetsPortRequirements) {
+      logDebug(s"Can't launch task, doesn't meets port requirements")
+    }
 
     cpus > 0 &&
       cpus <= offerCPUs &&
       cpus + totalCoresAcquired <= maxCores &&
       mem <= offerMem &&
       numExecutors() < executorLimit &&
-      slaves.get(slaveId).map(_.taskFailures).getOrElse(0) < MAX_SLAVE_FAILURES &&
+      latestFailuresForSlaveId < mesosSlaveBlacklistingMaxFailures &&
       meetsPortRequirements
   }
 
@@ -505,6 +535,20 @@ private[spark] class MesosCoarseGrainedSchedulerBackend(
     executorCoresOption.getOrElse(
       math.min(offerCPUs, maxCores - totalCoresAcquired)
     )
+  }
+
+  private def latestFailures(slaveId: String): Int = {
+    slaves.get(slaveId) match {
+      case Some(slave) =>
+        // resetting failures
+        if (slave.taskFailures >= mesosSlaveBlacklistingMaxFailures && slave.lastTaskFailureTs < clock.getTimeMillis() - mesosSlaveFailureTimeoutMs) {
+          slave.taskFailures = 0
+          logInfo(s"Blacklisting of Mesos slave $slaveId is timedout, reseting number of failures")
+        }
+        return slave.taskFailures
+      case None =>
+        return 0
+    }
   }
 
   override def statusUpdate(d: org.apache.mesos.SchedulerDriver, status: TaskStatus) {
@@ -557,8 +601,8 @@ private[spark] class MesosCoarseGrainedSchedulerBackend(
         // If it was a failure, mark the slave as failed for blacklisting purposes
         if (TaskState.isFailed(state)) {
           slave.taskFailures += 1
-
-          if (slave.taskFailures >= MAX_SLAVE_FAILURES) {
+          slave.lastTaskFailureTs = clock.getTimeMillis()
+          if (slave.taskFailures >= mesosSlaveBlacklistingMaxFailures) {
             logInfo(s"Blacklisting Mesos slave $slaveId due to too many failures; " +
                 "is Spark installed on it?")
           }
@@ -689,5 +733,6 @@ private[spark] class MesosCoarseGrainedSchedulerBackend(
 private class Slave(val hostname: String) {
   val taskIDs = new mutable.HashSet[String]()
   var taskFailures = 0
+  var lastTaskFailureTs = 0L
   var shuffleRegistered = false
 }

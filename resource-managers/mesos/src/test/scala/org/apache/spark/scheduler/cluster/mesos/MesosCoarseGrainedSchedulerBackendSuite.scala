@@ -22,7 +22,6 @@ import java.util.concurrent.TimeUnit
 import scala.collection.JavaConverters._
 import scala.concurrent.duration._
 import scala.reflect.ClassTag
-
 import org.apache.mesos.{Protos, Scheduler, SchedulerDriver}
 import org.apache.mesos.Protos._
 import org.mockito.Matchers
@@ -31,7 +30,6 @@ import org.mockito.Mockito._
 import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.mock.MockitoSugar
 import org.scalatest.BeforeAndAfter
-
 import org.apache.spark.{LocalSparkContext, SecurityManager, SparkConf, SparkContext, SparkFunSuite}
 import org.apache.spark.internal.config._
 import org.apache.spark.network.shuffle.mesos.MesosExternalShuffleClient
@@ -39,6 +37,7 @@ import org.apache.spark.rpc.{RpcAddress, RpcEndpointRef}
 import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.{RegisterExecutor, RemoveExecutor}
 import org.apache.spark.scheduler.TaskSchedulerImpl
 import org.apache.spark.scheduler.cluster.mesos.Utils._
+import org.apache.spark.util.{Clock, ManualClock}
 
 class MesosCoarseGrainedSchedulerBackendSuite extends SparkFunSuite
     with LocalSparkContext
@@ -52,6 +51,7 @@ class MesosCoarseGrainedSchedulerBackendSuite extends SparkFunSuite
   private var backend: MesosCoarseGrainedSchedulerBackend = _
   private var externalShuffleClient: MesosExternalShuffleClient = _
   private var driverEndpoint: RpcEndpointRef = _
+  private var clock: ManualClock = _
   @volatile private var stopCalled = false
 
   // All 'requests' to the scheduler run immediately on the same thread, so
@@ -105,6 +105,59 @@ class MesosCoarseGrainedSchedulerBackendSuite extends SparkFunSuite
 
     // Launches a new task on a valid offer from the same slave
     offerResources(List(offer2))
+    verifyTaskLaunched(driver, "o2")
+  }
+
+  test("mesos blacklists slaves with failed tasks") {
+    setBackend(Map(
+      "spark.mesos.fetcherCache.enable" -> "true",
+      "spark.mesos.slaves.blacklisting.maxFailures" -> "1"
+    ))
+
+    // launches a task on a valid offer on slave s0
+    val minMem = backend.executorMemory(sc) + 1024
+    val minCpu = 4
+    val offer1 = Resources(minMem, minCpu)
+    offerResources(List(offer1))
+    verifyTaskLaunched(driver, "o1")
+
+    // for any reason executor(aka mesos task) failed on s0
+    val status = createTaskStatus("0", "s1", TaskState.TASK_FAILED)
+    backend.statusUpdate(driver, status)
+
+    val offer2 = Resources(minMem, minCpu)
+    // Launches a new task on a valid offer from the same slave
+    offerResources(List(offer2))
+    // but since it's blacklisted the offer is declined
+    verifyDeclinedOffer(driver, createOfferId("o1"))
+  }
+
+
+  test("mesos blacklisting timeouts") {
+    setBackend(Map(
+      "spark.mesos.fetcherCache.enable" -> "true",
+      "spark.mesos.slaves.blacklisting.maxFailures" -> "1",
+      "spark.mesos.slaves.blacklisting.failureTimeout" -> "10s"
+    ))
+
+    // launches a task on a valid offer on slave s0
+    val minMem = backend.executorMemory(sc) + 1024
+    val minCpu = 4
+    val offer1 = Resources(minMem, minCpu)
+    offerResources(List(offer1))
+    verifyTaskLaunched(driver, "o1")
+
+    clock.setTime(100000L)
+    // for any reason executor(aka mesos task) failed on s0
+    val status = createTaskStatus("0", "s1", TaskState.TASK_FAILED)
+    backend.statusUpdate(driver, status)
+
+    clock.setTime(100000L + 10000 + 1) // timeout should expire
+    val offer2 = Resources(minMem, minCpu)
+
+    val mesosOffer = createOffer("o2", "s1", offer2.mem, offer2.cpus, None, offer2.gpus)
+    backend.resourceOffers(driver, List(mesosOffer).asJava)
+
     verifyTaskLaunched(driver, "o2")
   }
 
@@ -624,11 +677,12 @@ class MesosCoarseGrainedSchedulerBackendSuite extends SparkFunSuite
   private def createSchedulerBackend(
       taskScheduler: TaskSchedulerImpl,
       driver: SchedulerDriver,
-      shuffleClient: MesosExternalShuffleClient) = {
+      shuffleClient: MesosExternalShuffleClient,
+      clock: Clock) = {
     val securityManager = mock[SecurityManager]
 
     val backend = new MesosCoarseGrainedSchedulerBackend(
-        taskScheduler, sc, "master", securityManager) {
+        taskScheduler, sc, "master", securityManager, clock) {
       override protected def createSchedulerDriver(
           masterUrl: String,
           scheduler: Scheduler,
@@ -683,6 +737,8 @@ class MesosCoarseGrainedSchedulerBackendSuite extends SparkFunSuite
 
     externalShuffleClient = mock[MesosExternalShuffleClient]
 
-    backend = createSchedulerBackend(taskScheduler, driver, externalShuffleClient)
+    clock = new ManualClock()
+
+    backend = createSchedulerBackend(taskScheduler, driver, externalShuffleClient, clock)
   }
 }

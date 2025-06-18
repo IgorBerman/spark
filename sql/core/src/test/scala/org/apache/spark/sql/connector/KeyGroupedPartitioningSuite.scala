@@ -1619,7 +1619,6 @@ class KeyGroupedPartitioningSuite extends DistributionAndOrderingSuiteBase {
       }
     }
   }
-}
 
   test("SPARK-44647: shuffle one side and join keys are less than partition keys") {
     val items_partitions = Array(identity("id"), identity("name"))

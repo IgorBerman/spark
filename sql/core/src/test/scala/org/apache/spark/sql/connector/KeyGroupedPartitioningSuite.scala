@@ -250,6 +250,10 @@ class KeyGroupedPartitioningSuite extends DistributionAndOrderingSuiteBase {
       numRowsPerSplit = 1)
   }
 
+  private def selectWithMergeJoinHint(t1: String, t2: String): String = {
+    s"SELECT /*+ MERGE($t1, $t2) */ "
+  }
+
   private val customers: String = "customers"
   private val customers_schema = new StructType()
       .add("customer_name", StringType)
@@ -1306,7 +1310,7 @@ class KeyGroupedPartitioningSuite extends DistributionAndOrderingSuiteBase {
     val table1 = "tab1e1"
     val table2 = "table2"
     val partition = Array(identity("id"))
-    createTable(table1, columns, partition)
+    createTable(table1, schema, partition)
     sql(s"INSERT INTO testcat.ns.$table1 VALUES " +
         "(1, 'aa', cast('2020-01-01' as timestamp)), " +
         "(2, 'bb', cast('2020-01-01' as timestamp)), " +
@@ -1316,7 +1320,7 @@ class KeyGroupedPartitioningSuite extends DistributionAndOrderingSuiteBase {
         "(3, 'ee', cast('2020-01-01' as timestamp)), " +
         "(3, 'ee', cast('2020-01-01' as timestamp))")
 
-    createTable(table2, columns, partition)
+    createTable(table2, schema, partition)
     sql(s"INSERT INTO testcat.ns.$table2 VALUES " +
         "(4, 'zz', cast('2020-01-01' as timestamp)), " +
         "(4, 'zz', cast('2020-01-01' as timestamp)), " +
